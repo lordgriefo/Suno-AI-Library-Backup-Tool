@@ -1,0 +1,6 @@
+{
+  "name": "Suno AI Library Backup Tool",
+  "description": "PySide6 Python desktop application and interactive web manager to back up Suno AI music libraries with resume support and state tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

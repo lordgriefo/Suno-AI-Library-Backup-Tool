@@ -209,6 +209,29 @@ export const UsageGuide: React.FC<UsageGuideProps> = ({ onDownloadScript, theme 
           </button>
         </div>
       </div>
+
+      {/* Step 4: Video & Audio Direct Cloud Mode Explanation */}
+      <div
+        className={`border rounded-2xl p-5 space-y-3 shadow-xl ${
+          isLight ? "bg-white border-slate-200 text-slate-800" : "bg-[#121215] border-zinc-800 text-zinc-100"
+        }`}
+      >
+        <div className="flex items-center space-x-2">
+          <Sparkles className="w-4 h-4 text-purple-400" />
+          <h3 className="text-sm font-bold uppercase tracking-tight">
+            ⚡ Ultra-Fast 0% CPU Cloud Direct Architecture
+          </h3>
+        </div>
+
+        <div className={`text-xs space-y-2 leading-relaxed ${isLight ? "text-slate-600" : "text-zinc-400"}`}>
+          <p>
+            <strong>Official Suno Lyric Videos (MP4):</strong> Suno renders high-definition lyric videos with dynamic text animations on their own cloud servers. When video backup is enabled, the tool sends on-demand render triggers to Suno’s servers without consuming your computer's CPU. Completed lyric videos are directly saved from Suno's CDN.
+          </p>
+          <p>
+            <strong>Pro Tip for Large Libraries (1,000+ tracks):</strong> Keep <em>Video (MP4)</em> unchecked for maximum download speed. Your audio (WAV/MP3), cover art (JPG), and metadata (JSON/CSV) will download instantly at pure gigabit network speeds with zero CPU overhead.
+          </p>
+        </div>
+      </div>
     </div>
   );
 };

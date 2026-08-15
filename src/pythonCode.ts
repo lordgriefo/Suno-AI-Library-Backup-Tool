@@ -21,7 +21,7 @@ export function generatePythonScript(options: {
   const dlAudio = pyBool(options.downloadAudio ?? true);
   const preferredFormat = options.preferredAudioFormat || (options.preferWav !== false ? "wav" : "mp3");
   const prefWav = pyBool(preferredFormat === "wav");
-  const dlVideo = pyBool(options.downloadVideo ?? true);
+  const dlVideo = pyBool(options.downloadVideo ?? false);
   const dlImg = pyBool(options.downloadImages ?? true);
   const dlMeta = pyBool(options.downloadMetadata ?? true);
   const grouping = options.folderGrouping ?? "none";
@@ -62,6 +62,8 @@ import time
 import base64
 import random
 import logging
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import requests
@@ -224,10 +226,110 @@ def build_full_browser_headers(token: str = "", cookie_str: str = "") -> Dict[st
     return headers
 
 
+def get_ffmpeg_executable() -> Optional[str]:
+    """Finds FFmpeg executable in PATH, imageio_ffmpeg, or local directory."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        return ffmpeg_bin
+        
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+        
+    # Check common Windows paths
+    common_win_paths = [
+        Path.home() / "ffmpeg" / "bin" / "ffmpeg.exe",
+        Path("C:/ffmpeg/bin/ffmpeg.exe"),
+        Path("C:/ProgramData/chocolatey/bin/ffmpeg.exe"),
+        Path("./ffmpeg.exe")
+    ]
+    for p in common_win_paths:
+        if p.exists():
+            return str(p)
+            
+    return None
+
+
+def convert_audio_to_wav(source_audio_path: Path, target_wav_path: Path) -> bool:
+    """
+    Decodes and converts audio stream (MP3/AAC) to standard 16-bit PCM 44.1kHz WAV.
+    First checks for FFmpeg (system or imageio-ffmpeg), then falls back to python audio decoding.
+    """
+    if not source_audio_path.exists():
+        return False
+
+    ffmpeg_bin = get_ffmpeg_executable()
+    if ffmpeg_bin:
+        try:
+            cmd = [
+                ffmpeg_bin, "-y",
+                "-i", str(source_audio_path),
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", "44100",
+                "-ac", "2",
+                str(target_wav_path)
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+            if res.returncode == 0 and target_wav_path.exists() and target_wav_path.stat().st_size > 1024:
+                return True
+        except Exception:
+            pass
+
+    # Fallback to pydub if installed in user's python environment
+    try:
+        from pydub import AudioSegment  # type: ignore
+        sound = AudioSegment.from_file(str(source_audio_path))
+        sound.export(str(target_wav_path), format="wav")
+        if target_wav_path.exists() and target_wav_path.stat().st_size > 1024:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def create_mp4_video_visualizer(image_path: Path, audio_path: Path, target_video_path: Path) -> bool:
+    """
+    Creates an MP4 video visualizer combining the Suno album art image and audio track locally via FFmpeg.
+    """
+    if not image_path.exists() or not audio_path.exists():
+        return False
+
+    ffmpeg_bin = get_ffmpeg_executable()
+    if not ffmpeg_bin:
+        return False
+
+    try:
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-loop", "1",
+            "-i", str(image_path),
+            "-i", str(audio_path),
+            "-c:v", "libx264",
+            "-tune", "stillimage",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+            str(target_video_path)
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+        if res.returncode == 0 and target_video_path.exists() and target_video_path.stat().st_size > 1024:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 class BackupWorker(QThread):
     """
     Background worker thread running Suno API fetch and file downloading logic.
     Handles on-demand WAV and MP4 video generation requests on Suno endpoints.
+    Supports selective track batching and automated resume.
     """
     log_signal = Signal(str, str)             # (message, level: info|success|warn|error)
     progress_signal = Signal(int, int)        # (current, total)
@@ -253,7 +355,8 @@ class BackupWorker(QThread):
         min_delay: float = 0.5,
         max_delay: float = 2.0,
         trigger_wav_api: bool = True,
-        trigger_video_api: bool = True
+        trigger_video_api: bool = True,
+        selected_clips: Optional[List[Dict[str, Any]]] = None
     ):
         super().__init__()
         self.token = clean_header_value(token)
@@ -272,6 +375,7 @@ class BackupWorker(QThread):
         self.max_delay = float(max_delay)
         self.trigger_wav_api = trigger_wav_api
         self.trigger_video_api = trigger_video_api
+        self.selected_clips = selected_clips if (selected_clips is not None and isinstance(selected_clips, list)) else None
         
         self.is_cancelled = False
         self.state_file_path = self.save_dir / STATE_FILENAME
@@ -582,7 +686,19 @@ class BackupWorker(QThread):
             self.save_dir.mkdir(parents=True, exist_ok=True)
             self.load_state()
             
-            clips = self.fetch_all_clips()
+            # Check FFmpeg availability for WAV / MP4 processing
+            ffmpeg_path = get_ffmpeg_executable()
+            if ffmpeg_path:
+                self.log(f"🎬 FFmpeg audio/video engine active: {ffmpeg_path}", "info")
+            else:
+                self.log("ℹ️ Note: System FFmpeg not found. Audio streams will be preserved as high-quality 320kbps MP3s. (To enable instant offline WAV/MP4 conversion, install FFmpeg or run: pip install imageio-ffmpeg pydub)", "info")
+
+            if self.selected_clips is not None and isinstance(self.selected_clips, list):
+                clips = self.selected_clips
+                self.log(f"🎯 Selective Backup Mode: Processing {len(clips)} user-selected track(s)...", "info")
+            else:
+                clips = self.fetch_all_clips()
+
             if self.is_cancelled:
                 self.finished_signal.emit(False, "Backup process cancelled by user.")
                 return
@@ -689,7 +805,8 @@ class BackupWorker(QThread):
                         self.cleanup_tmp(tmp_json)
                         success_all = False
                 
-                # 2. Audio (Lossless WAV with API trigger + MP3 fallback)
+                # 2. Audio (Lossless WAV with API trigger + Conversion Fallback + MP3)
+                downloaded_audio_path: Optional[Path] = None
                 if self.download_audio:
                     audio_downloaded = False
                     
@@ -733,27 +850,58 @@ class BackupWorker(QThread):
                                 total_files_downloaded += 1
                                 total_bytes_downloaded += b_w
                                 audio_downloaded = True
-                                self.log(f"  ✨ [WAV SUCCESS] Downloaded lossless WAV ({format_bytes(b_w)}) for '{clean_title}'", "success")
+                                downloaded_audio_path = wav_path
+                                self.log(f"  ✨ [WAV SUCCESS] Downloaded native lossless WAV ({format_bytes(b_w)}) for '{clean_title}'", "success")
                                 break
                         
+                        # If Suno CDN does not have a pre-rendered WAV file, stream the official 320kbps MP3 directly (0% CPU load)
                         if not audio_downloaded and not self.is_cancelled:
-                            self.log(f"  [WAV Fallback] WAV unavailable on Suno CDN for '{clean_title}'. Downloading MP3 fallback...", "warn")
+                            fallback_url = clip.get("audio_url")
+                            if fallback_url:
+                                mp3_target = dest_dir / f"{clip_prefix}.mp3"
+                                ok_stream, b_stream = self.download_file_with_retry(fallback_url, mp3_target, silent_fail=True)
+                                if ok_stream:
+                                    downloaded_files.append(rel_path(f"{clip_prefix}.mp3"))
+                                    total_files_downloaded += 1
+                                    total_bytes_downloaded += b_stream
+                                    audio_downloaded = True
+                                    downloaded_audio_path = mp3_target
+                                    self.log(f"  [MP3 STREAM] Saved Suno 320kbps audio stream for '{clean_title}' (WAV queued in Suno cloud)", "info")
 
                     if not audio_downloaded and not self.is_cancelled:
                         fallback_url = clip.get("audio_url")
                         ext = ".wav" if (fallback_url and ".wav" in fallback_url.lower()) else ".mp3"
                         audio_file = f"{clip_prefix}{ext}"
-                        ok_a, b_a = self.download_file_with_retry(fallback_url, dest_dir / audio_file)
+                        audio_target = dest_dir / audio_file
+                        ok_a, b_a = self.download_file_with_retry(fallback_url, audio_target)
                         if ok_a:
                             downloaded_files.append(rel_path(audio_file))
                             total_files_downloaded += 1
                             total_bytes_downloaded += b_a
                             audio_downloaded = True
-                            self.log(f"  [MP3 SUCCESS] Downloaded audio track for '{clean_title}'", "success")
+                            downloaded_audio_path = audio_target
+                            self.log(f"  [AUDIO SUCCESS] Downloaded track for '{clean_title}'", "success")
                         else:
                             success_all = False
-                
-                # 3. Video (MP4 with active trigger)
+
+                # 3. Cover Art Image
+                image_url = clip.get("image_large_url") or clip.get("image_url")
+                downloaded_image_path: Optional[Path] = None
+                if (self.download_image or self.download_video) and image_url:
+                    image_file = f"{clip_prefix}.jpg"
+                    image_target = dest_dir / image_file
+                    ok_i, b_i = self.download_file_with_retry(image_url, image_target)
+                    if ok_i:
+                        if self.download_image:
+                            downloaded_files.append(rel_path(image_file))
+                            total_files_downloaded += 1
+                            total_bytes_downloaded += b_i
+                        downloaded_image_path = image_target
+                    else:
+                        if self.download_image:
+                            success_all = False
+
+                # 4. Video (Official Suno Animated Lyric Video - 0% Local CPU Overhead)
                 if self.download_video:
                     video_candidates = []
                     for field in ["video_url", "video_mp4_url", "download_video_url"]:
@@ -772,7 +920,7 @@ class BackupWorker(QThread):
                     video_path = dest_dir / video_file
                     video_downloaded = False
 
-                    # Check direct download first
+                    # Check direct download for official animated lyric video rendered on Suno servers
                     for v_url in unique_video_candidates:
                         if self.is_cancelled:
                             break
@@ -782,38 +930,14 @@ class BackupWorker(QThread):
                             total_files_downloaded += 1
                             total_bytes_downloaded += b_v
                             video_downloaded = True
-                            self.log(f"  🎬 [MP4 SUCCESS] Downloaded video animation for '{clean_title}'", "success")
+                            self.log(f"  🎬 [MP4 SUCCESS] Downloaded official Suno lyric video ({format_bytes(b_v)}) for '{clean_title}'", "success")
                             break
 
-                    # If not already rendered on Suno, trigger generation on Suno backend
-                    if not video_downloaded and not self.is_cancelled and self.trigger_video_api:
-                        triggered = self.request_video_generation(clip_id)
-                        if triggered:
-                            time.sleep(2.0)  # Brief wait for Suno render queue
-                            for v_url in unique_video_candidates:
-                                ok_v2, b_v2 = self.download_file_with_retry(v_url, video_path, silent_fail=True)
-                                if ok_v2:
-                                    downloaded_files.append(rel_path(video_file))
-                                    total_files_downloaded += 1
-                                    total_bytes_downloaded += b_v2
-                                    video_downloaded = True
-                                    self.log(f"  🎬 [MP4 SUCCESS] Downloaded newly rendered video for '{clean_title}'", "success")
-                                    break
-
+                    # If not yet rendered on Suno cloud, trigger Suno backend render queue (0% CPU)
                     if not video_downloaded and not self.is_cancelled:
-                        self.log(f"  ℹ️ [MP4 Notice] Video animation queued or not rendered for '{clean_title}'.", "info")
-
-                # 4. Cover Art Image
-                image_url = clip.get("image_large_url") or clip.get("image_url")
-                if self.download_image and image_url:
-                    image_file = f"{clip_prefix}.jpg"
-                    ok_i, b_i = self.download_file_with_retry(image_url, dest_dir / image_file)
-                    if ok_i:
-                        downloaded_files.append(rel_path(image_file))
-                        total_files_downloaded += 1
-                        total_bytes_downloaded += b_i
-                    else:
-                        success_all = False
+                        if self.trigger_video_api:
+                            self.request_video_generation(clip_id)
+                            self.log(f"  ℹ️ [MP4 Queued] Sent official lyric video render request to Suno for '{clean_title}'. (Will download on next sync)", "info")
 
                 if success_all:
                     self.state_data["completed_clips"][clip_id] = {
@@ -1029,7 +1153,8 @@ class SunoBackupWindow(QMainWindow):
         r_media = QHBoxLayout()
         self.chk_audio = QCheckBox("Audio Tracks")
         self.chk_audio.setChecked(${dlAudio})
-        self.chk_video = QCheckBox("Video (MP4)")
+        self.chk_video = QCheckBox("Official Video (MP4) [Cloud Rendered]")
+        self.chk_video.setToolTip("Downloads official animated lyric videos rendered by Suno servers. (Default OFF for ultra-fast zero CPU streaming)")
         self.chk_video.setChecked(${dlVideo})
         self.chk_image = QCheckBox("Cover Artwork")
         self.chk_image.setChecked(${dlImg})
@@ -1064,7 +1189,7 @@ class SunoBackupWindow(QMainWindow):
         self.start_btn.setObjectName("StartButton")
         self.start_btn.setFixedHeight(38)
         self.start_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self.start_btn.clicked.connect(self.start_backup)
+        self.start_btn.clicked.connect(self.start_full_backup)
 
         self.cancel_btn = QPushButton("🛑 Cancel")
         self.cancel_btn.setObjectName("CancelButton")
@@ -1158,31 +1283,276 @@ class SunoBackupWindow(QMainWindow):
     def setup_catalog_tab(self):
         layout = QVBoxLayout(self.tab_catalog)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        top_row = QHBoxLayout()
+        # Toolbar Row 1: Action Controls
+        action_bar = QHBoxLayout()
+        action_bar.setSpacing(8)
+
+        self.btn_download_selected = QPushButton("📥 Download Selected (0)")
+        self.btn_download_selected.setStyleSheet("background-color: #0284c7; color: #ffffff; font-weight: bold; border: 1px solid #38bdf8;")
+        self.btn_download_selected.clicked.connect(self.start_selected_backup)
+
+        self.btn_export_csv = QPushButton("📊 Export CSV")
+        self.btn_export_csv.setStyleSheet("background-color: #064e3b; color: #34d399; font-weight: bold; border: 1px solid #059669;")
+        self.btn_export_csv.clicked.connect(self.export_catalog_csv)
+
+        self.btn_export_json = QPushButton("📄 Export JSON")
+        self.btn_export_json.setStyleSheet("background-color: #3b0764; color: #c084fc; font-weight: bold; border: 1px solid #9333ea;")
+        self.btn_export_json.clicked.connect(self.export_catalog_json)
+
+        self.btn_fetch_feed = QPushButton("🔄 Fetch Feed from Suno")
+        self.btn_fetch_feed.clicked.connect(self.fetch_feed_catalog_only)
+
+        self.btn_refresh = QPushButton("📁 Load from Folder")
+        self.btn_refresh.clicked.connect(self.reload_catalog_from_file)
+
+        action_bar.addWidget(self.btn_download_selected)
+        action_bar.addWidget(self.btn_export_csv)
+        action_bar.addWidget(self.btn_export_json)
+        action_bar.addStretch(1)
+        action_bar.addWidget(self.btn_fetch_feed)
+        action_bar.addWidget(self.btn_refresh)
+        layout.addLayout(action_bar)
+
+        # Toolbar Row 2: Search, Filters & Selection Helpers
+        filter_bar = QHBoxLayout()
+        filter_bar.setSpacing(8)
+
         self.search_catalog = QLineEdit()
         self.search_catalog.setPlaceholderText("🔍 Filter tracks by title, model, style prompt...")
         self.search_catalog.textChanged.connect(self.filter_catalog_table)
-        
-        btn_refresh = QPushButton("🔄 Refresh from Folder")
-        btn_refresh.clicked.connect(self.reload_catalog_from_file)
-        
-        top_row.addWidget(self.search_catalog, 1)
-        top_row.addWidget(btn_refresh)
-        layout.addLayout(top_row)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Title", "Duration", "Model", "Style Tags / Prompt", "Status"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.cmb_filter_status = QComboBox()
+        self.cmb_filter_status.addItem("All Tracks", "all")
+        self.cmb_filter_status.addItem("Completed Only", "completed")
+        self.cmb_filter_status.addItem("Pending Only", "pending")
+        self.cmb_filter_status.currentIndexChanged.connect(lambda: self.filter_catalog_table(self.search_catalog.text()))
+
+        btn_select_all = QPushButton("Select All")
+        btn_select_all.clicked.connect(self.select_all_catalog)
+
+        btn_select_pending = QPushButton("Select Pending")
+        btn_select_pending.clicked.connect(self.select_pending_catalog)
+
+        btn_deselect_all = QPushButton("Deselect All")
+        btn_deselect_all.clicked.connect(self.deselect_all_catalog)
+
+        filter_bar.addWidget(self.search_catalog, 2)
+        filter_bar.addWidget(self.cmb_filter_status, 1)
+        filter_bar.addWidget(btn_select_all)
+        filter_bar.addWidget(btn_select_pending)
+        filter_bar.addWidget(btn_deselect_all)
+        layout.addLayout(filter_bar)
+
+        # Interactive Table Widget
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["", "Title", "Duration", "Model", "Style Tags / Prompt", "Status"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 36)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setStyleSheet("background-color: #0b0f19; color: #f1f5f9; gridline-color: #1e293b;")
+        self.table.itemChanged.connect(self.on_table_item_changed)
         layout.addWidget(self.table, 1)
+
+    def on_table_item_changed(self, item: QTableWidgetItem):
+        if self.is_updating_table or item.column() != 0:
+            return
+        clip_id = item.data(Qt.UserRole)
+        if not clip_id:
+            return
+        if item.checkState() == Qt.Checked:
+            self.selected_track_ids.add(clip_id)
+        else:
+            self.selected_track_ids.discard(clip_id)
+        self.btn_download_selected.setText(f"📥 Download Selected ({len(self.selected_track_ids)})")
+
+    def select_all_catalog(self):
+        self.is_updating_table = True
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                clip_id = item.data(Qt.UserRole)
+                item.setCheckState(Qt.Checked)
+                if clip_id:
+                    self.selected_track_ids.add(clip_id)
+        self.is_updating_table = False
+        self.btn_download_selected.setText(f"📥 Download Selected ({len(self.selected_track_ids)})")
+
+    def select_pending_catalog(self):
+        self.is_updating_table = True
+        save_path = Path(self.dir_input.text().strip())
+        state_file = save_path / STATE_FILENAME
+        completed_set = set()
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    completed_set = set(json.load(f).get("completed_clips", {}).keys())
+            except Exception:
+                pass
+
+        self.selected_track_ids.clear()
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                clip_id = item.data(Qt.UserRole)
+                if clip_id and clip_id not in completed_set:
+                    item.setCheckState(Qt.Checked)
+                    self.selected_track_ids.add(clip_id)
+                else:
+                    item.setCheckState(Qt.Unchecked)
+        self.is_updating_table = False
+        self.btn_download_selected.setText(f"📥 Download Selected ({len(self.selected_track_ids)})")
+
+    def deselect_all_catalog(self):
+        self.is_updating_table = True
+        self.selected_track_ids.clear()
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                item.setCheckState(Qt.Unchecked)
+        self.is_updating_table = False
+        self.btn_download_selected.setText("📥 Download Selected (0)")
+
+    def export_catalog_csv(self):
+        if not self.catalog_tracks:
+            QMessageBox.warning(self, "Export CSV", "No catalog tracks loaded yet. Please run a backup or click 'Fetch Feed from Suno'.")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Catalog to CSV", str(Path.home() / "suno_catalog.csv"), "CSV Files (*.csv)")
+        if not file_path:
+            return
+
+        save_path = Path(self.dir_input.text().strip())
+        state_file = save_path / STATE_FILENAME
+        completed_set = set()
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    completed_set = set(json.load(f).get("completed_clips", {}).keys())
+            except Exception:
+                pass
+
+        csv_columns = [
+            "id", "title", "created_at", "model_name", "tags", "prompt", 
+            "gpt_description_prompt", "duration_seconds", "is_liked", "is_public",
+            "audio_url", "video_url", "image_url", "backup_status"
+        ]
+        
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=csv_columns)
+                writer.writeheader()
+                for clip in self.catalog_tracks:
+                    clip_id = clip.get("id", "")
+                    meta = clip.get("metadata") or {}
+                    tags = meta.get("tags") if isinstance(meta, dict) else ""
+                    prompt = meta.get("prompt") if isinstance(meta, dict) else ""
+                    gpt_prompt = meta.get("gpt_description_prompt") if isinstance(meta, dict) else ""
+                    is_completed = clip_id in completed_set
+                    writer.writerow({
+                        "id": clip_id,
+                        "title": clip.get("title") or "Untitled Track",
+                        "created_at": clip.get("created_at") or "",
+                        "model_name": clip.get("model_name") or (meta.get("type") if isinstance(meta, dict) else "") or "",
+                        "tags": tags or "",
+                        "prompt": prompt or "",
+                        "gpt_description_prompt": gpt_prompt or "",
+                        "duration_seconds": clip.get("duration") or (meta.get("duration") if isinstance(meta, dict) else "") or "",
+                        "is_liked": clip.get("is_liked") or False,
+                        "is_public": clip.get("is_public") or False,
+                        "audio_url": clip.get("audio_url") or "",
+                        "video_url": clip.get("video_url") or "",
+                        "image_url": clip.get("image_large_url") or clip.get("image_url") or "",
+                        "backup_status": "Completed" if is_completed else "Pending"
+                    })
+            QMessageBox.information(self, "Export Successful", f"✅ Successfully exported {len(self.catalog_tracks)} tracks to CSV:\\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Failed to write CSV file:\\n{e}")
+
+    def export_catalog_json(self):
+        if not self.catalog_tracks:
+            QMessageBox.warning(self, "Export JSON", "No catalog tracks loaded yet. Please run a backup or click 'Fetch Feed from Suno'.")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(self, "Export Catalog to JSON", str(Path.home() / "suno_catalog.json"), "JSON Files (*.json)")
+        if not file_path:
+            return
+
+        try:
+            catalog_json_data = {
+                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_tracks": len(self.catalog_tracks),
+                "tracks": self.catalog_tracks
+            }
+            with open(file_path, "w", encoding="utf-8") as json_file:
+                json.dump(catalog_json_data, json_file, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Export Successful", f"✅ Successfully exported {len(self.catalog_tracks)} tracks to JSON:\\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Failed to write JSON file:\\n{e}")
+
+    def fetch_feed_catalog_only(self):
+        token = clean_header_value(self.token_input.text())
+        cookie_val = clean_header_value(self.cookie_input.text())
+        if not token:
+            QMessageBox.warning(self, "Token Required", "Please enter your Bearer token in the Dashboard tab first.")
+            return
+
+        self.table.setRowCount(0)
+        self.catalog_tracks = []
+        self.selected_track_ids.clear()
+        self.btn_download_selected.setText("📥 Download Selected (0)")
+        
+        headers = build_full_browser_headers(token, cookie_val)
+        session = requests.Session()
+        session.headers.update(headers)
+        
+        self.append_log("Fetching library catalog from Suno API...", "info")
+        
+        page = 0
+        total_fetched = 0
+        while True:
+            url = f"https://studio-api.suno.ai/api/feed/?page={page}"
+            try:
+                r = session.get(url, timeout=12)
+                if r.status_code == 401:
+                    QMessageBox.critical(self, "Token Expired", "❌ Suno returned 401 Unauthorized. Please refresh Suno.com and paste a new token.")
+                    break
+                r.raise_for_status()
+                data = r.json()
+                page_clips = data if isinstance(data, list) else (data.get("clips") or data.get("items") or [])
+                if not page_clips:
+                    break
+                for c in page_clips:
+                    self.add_catalog_row(c)
+                total_fetched += len(page_clips)
+                page += 1
+                QApplication.processEvents()
+            except Exception as e:
+                self.append_log(f"Catalog fetch stopped at page {page}: {e}", "warn")
+                break
+                
+        self.pill_total.setText(f"Tracks: {len(self.catalog_tracks)}")
+        QMessageBox.information(self, "Catalog Loaded", f"✅ Successfully fetched {len(self.catalog_tracks)} tracks from your Suno account!")
+
+    def start_selected_backup(self):
+        if not self.selected_track_ids:
+            QMessageBox.warning(self, "No Selection", "Please check at least one track in the catalog table to download.")
+            return
+            
+        selected_clips = [c for c in self.catalog_tracks if c.get("id") in self.selected_track_ids]
+        if not selected_clips:
+            QMessageBox.warning(self, "No Selection", "Selected tracks could not be found in memory.")
+            return
+
+        self.tabs.setCurrentWidget(self.tab_dashboard)
+        self.start_backup(selected_clips=selected_clips)
 
     def setup_settings_tab(self):
         layout = QVBoxLayout(self.tab_settings)
@@ -1436,28 +1806,65 @@ class SunoBackupWindow(QMainWindow):
         self.catalog_tracks.append(clip)
         row = self.table.rowCount()
         self.table.insertRow(row)
+        clip_id = clip.get("id") or ""
         title = clip.get("title") or "Untitled Track"
         duration = str(int(clip.get("duration") or 0)) + "s"
         model = clip.get("model_name") or "v3.5"
         tags = (clip.get("metadata") or {}).get("tags") or clip.get("prompt") or ""
-        status = "Found"
 
-        self.table.setItem(row, 0, QTableWidgetItem(title))
-        self.table.setItem(row, 1, QTableWidgetItem(duration))
-        self.table.setItem(row, 2, QTableWidgetItem(model))
-        self.table.setItem(row, 3, QTableWidgetItem(str(tags)[:60]))
-        self.table.setItem(row, 4, QTableWidgetItem(status))
+        save_path = Path(self.dir_input.text().strip())
+        state_file = save_path / STATE_FILENAME
+        is_completed = False
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    is_completed = clip_id in json.load(f).get("completed_clips", {})
+            except Exception:
+                pass
+
+        status = "Completed" if is_completed else "Pending"
+
+        self.is_updating_table = True
+        chk_item = QTableWidgetItem()
+        chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        chk_item.setCheckState(Qt.Checked if clip_id in self.selected_track_ids else Qt.Unchecked)
+        chk_item.setData(Qt.UserRole, clip_id)
+
+        self.table.setItem(row, 0, chk_item)
+        self.table.setItem(row, 1, QTableWidgetItem(title))
+        self.table.setItem(row, 2, QTableWidgetItem(duration))
+        self.table.setItem(row, 3, QTableWidgetItem(model))
+        self.table.setItem(row, 4, QTableWidgetItem(str(tags)[:60]))
+        
+        status_item = QTableWidgetItem(status)
+        if is_completed:
+            status_item.setForeground(QColor("#34d399"))
+        else:
+            status_item.setForeground(QColor("#fbbf24"))
+        self.table.setItem(row, 5, status_item)
+        self.is_updating_table = False
 
     def filter_catalog_table(self, query: str):
         q = query.lower()
+        filter_mode = self.cmb_filter_status.currentData() if hasattr(self, "cmb_filter_status") else "all"
+
         for r in range(self.table.rowCount()):
-            match = False
-            for c in range(self.table.columnCount()):
+            match_text = False
+            for c in range(1, self.table.columnCount()):
                 item = self.table.item(r, c)
                 if item and q in item.text().lower():
-                    match = True
+                    match_text = True
                     break
-            self.table.setRowHidden(r, not match)
+
+            status_item = self.table.item(r, 5)
+            status_text = status_item.text().lower() if status_item else ""
+            match_status = True
+            if filter_mode == "completed" and status_text != "completed":
+                match_status = False
+            elif filter_mode == "pending" and status_text != "pending":
+                match_status = False
+
+            self.table.setRowHidden(r, not (match_text and match_status))
 
     def reload_catalog_from_file(self):
         cat_file = Path(self.dir_input.text().strip()) / CATALOG_JSON_FILENAME
@@ -1468,14 +1875,23 @@ class SunoBackupWindow(QMainWindow):
                     tracks = data.get("tracks", [])
                     self.table.setRowCount(0)
                     self.catalog_tracks = []
+                    self.selected_track_ids.clear()
                     for t in tracks:
                         self.add_catalog_row(t)
+                    self.pill_total.setText(f"Tracks: {len(tracks)}")
+                    QMessageBox.information(self, "Catalog Loaded", f"✅ Loaded {len(tracks)} tracks from offline index!")
             except Exception as e:
                 QMessageBox.warning(self, "Catalog", f"Error loading catalog: {e}")
         else:
-            QMessageBox.information(self, "Catalog", "Run a backup first to generate the catalog index file.")
+            QMessageBox.information(self, "Catalog", "Run a backup or click 'Fetch Feed from Suno' first to populate the catalog.")
 
-    def start_backup(self):
+    def start_full_backup(self):
+        self.start_backup(selected_clips=None)
+
+    def start_backup(self, selected_clips: Optional[List[Dict[str, Any]]] = None):
+        if not isinstance(selected_clips, list):
+            selected_clips = None
+
         token = clean_header_value(self.token_input.text())
         cookie_str = clean_header_value(self.cookie_input.text())
         save_dir_str = self.dir_input.text().strip()
@@ -1515,8 +1931,10 @@ class SunoBackupWindow(QMainWindow):
         self.dir_input.setEnabled(False)
         self.progress_bar.setValue(0)
         self.log_box.clear()
-        self.table.setRowCount(0)
-        self.catalog_tracks = []
+        
+        if selected_clips is None:
+            self.table.setRowCount(0)
+            self.catalog_tracks = []
 
         self.append_log("Starting Suno AI backup process...", "info")
 
@@ -1541,7 +1959,8 @@ class SunoBackupWindow(QMainWindow):
             min_delay=0.5,
             max_delay=max_d,
             trigger_wav_api=self.chk_auto_wav.isChecked(),
-            trigger_video_api=self.chk_auto_video.isChecked()
+            trigger_video_api=self.chk_auto_video.isChecked(),
+            selected_clips=selected_clips
         )
 
         self.worker.log_signal.connect(self.append_log)

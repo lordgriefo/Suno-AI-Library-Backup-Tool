@@ -26,7 +26,14 @@ import {
   Loader2,
   ShieldCheck,
   ShieldAlert,
-  KeyRound
+  KeyRound,
+  Search,
+  CheckSquare,
+  Square as SquareIcon,
+  ListChecks,
+  FileJson,
+  Sliders,
+  BookOpen
 } from "lucide-react";
 import { MOCK_SUNO_TRACKS } from "../data/mockTracks";
 import { LogEntry, BackupStateFile, SunoTrack } from "../types";
@@ -62,16 +69,19 @@ const formatDuration = (seconds: number): string => {
 
 export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme = "dark" }) => {
   const isLight = theme === "light";
+  
+  // Tab Navigation: Dashboard, Library / Batch Downloader, Guide, Settings
+  const [activeTab, setActiveTab] = useState<"dashboard" | "library" | "guide" | "settings">("dashboard");
+
   const [bearerToken, setBearerToken] = useState<string>("mock_suno_bearer_token_12345");
   const [cookieString, setCookieString] = useState<string>("");
   const [showToken, setShowToken] = useState<boolean>(false);
   const [saveDirectory, setSaveDirectory] = useState<string>("/Users/music/Suno_Backup");
 
-  
   const [downloadAudio, setDownloadAudio] = useState<boolean>(true);
   const [preferredFormat, setPreferredFormat] = useState<"wav" | "mp3">("wav");
   const [preferWav, setPreferWav] = useState<boolean>(true);
-  const [downloadVideo, setDownloadVideo] = useState<boolean>(true);
+  const [downloadVideo, setDownloadVideo] = useState<boolean>(false);
   const [downloadImages, setDownloadImages] = useState<boolean>(true);
   const [downloadMetadata, setDownloadMetadata] = useState<boolean>(true);
   const [generateReport, setGenerateReport] = useState<boolean>(true);
@@ -80,6 +90,12 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
   // Human Mimicry / Anti-Block Randomized Delay
   const [minDelay, setMinDelay] = useState<number>(1.0);
   const [maxDelay, setMaxDelay] = useState<number>(3.0);
+
+  // Library multi-selection & search state
+  const [libraryTracks, setLibraryTracks] = useState<SunoTrack[]>(MOCK_SUNO_TRACKS);
+  const [selectedTrackIds, setSelectedTrackIds] = useState<Set<string>>(new Set(MOCK_SUNO_TRACKS.map(t => t.id)));
+  const [librarySearchQuery, setLibrarySearchQuery] = useState<string>("");
+  const [libraryFilterStatus, setLibraryFilterStatus] = useState<"all" | "completed" | "pending">("all");
 
   // Batch Tracker Live Statistics State
   const [wavSuccessCount, setWavSuccessCount] = useState<number>(0);
@@ -102,14 +118,15 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
   // Quick Setup Token Helper Modal State
   const [isQuickSetupOpen, setIsQuickSetupOpen] = useState<boolean>(false);
 
-  // Export CSV catalog directly from browser
+  // Export CSV catalog with full metadata (lyrics, style tags, duration, status, URLs)
   const handleExportCsvCatalog = () => {
     const headers = [
       "id",
       "title",
       "created_at",
       "model_name",
-      "tags_and_prompt",
+      "style_tags_and_prompt",
+      "lyrics",
       "duration_seconds",
       "is_liked",
       "audio_url",
@@ -120,10 +137,11 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
 
     const csvRows = [headers.join(",")];
     
-    MOCK_SUNO_TRACKS.forEach((track) => {
+    libraryTracks.forEach((track) => {
       const isCompleted = stateFile.completed_clips[track.id] ? "Completed" : "Pending";
       const cleanTitle = (track.title || "").replace(/"/g, '""');
       const cleanPrompt = (track.prompt || "").replace(/"/g, '""');
+      const cleanLyrics = (track.gpt_description_prompt || track.prompt || "").replace(/"/g, '""');
       
       const row = [
         `"${track.id}"`,
@@ -131,6 +149,7 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
         `"${track.created_at || ""}"`,
         `"${track.model_name || "v3.5"}"`,
         `"${cleanPrompt}"`,
+        `"${cleanLyrics}"`,
         `"${track.duration || 120}"`,
         `"${track.is_liked ? "TRUE" : "FALSE"}"`,
         `"${track.audio_url || ""}"`,
@@ -146,13 +165,82 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.setAttribute("download", "suno_library_catalog.csv");
+    link.setAttribute("download", `suno_library_catalog_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
 
-    addLog("📥 Exported 'suno_library_catalog.csv' offline catalog report directly to your downloads!", "success");
+    addLog("📥 Exported 'suno_library_catalog.csv' offline spreadsheet catalog directly to your downloads!", "success");
+  };
+
+  // Export JSON library metadata file
+  const handleExportJsonCatalog = () => {
+    const exportData = {
+      export_timestamp: new Date().toISOString(),
+      generator: "Suno AI Library Backup Tool",
+      total_tracks: libraryTracks.length,
+      completed_tracks: Object.keys(stateFile.completed_clips).length,
+      tracks: libraryTracks.map((track) => ({
+        id: track.id,
+        title: track.title,
+        created_at: track.created_at,
+        model_name: track.model_name || "chirp-v3-5",
+        style_prompt: track.prompt,
+        lyrics: track.gpt_description_prompt || track.prompt,
+        duration: track.duration || 120,
+        is_liked: track.is_liked || false,
+        audio_url: track.audio_url,
+        wav_url: track.wav_url,
+        video_url: track.video_url,
+        image_url: track.image_url,
+        image_large_url: track.image_large_url,
+        backup_status: stateFile.completed_clips[track.id] ? "completed" : "pending",
+        backup_files: stateFile.completed_clips[track.id]?.files || []
+      }))
+    };
+
+    const jsonContent = JSON.stringify(exportData, null, 2);
+    const blob = new Blob([jsonContent], { type: "application/json;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", `suno_library_metadata_${new Date().toISOString().slice(0, 10)}.json`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    addLog("📥 Exported 'suno_library_metadata.json' structured metadata archive directly to your downloads!", "success");
+  };
+
+  // Toggle single track selection
+  const handleToggleSelectTrack = (id: string) => {
+    setSelectedTrackIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  // Master selection handlers
+  const handleSelectAll = () => {
+    setSelectedTrackIds(new Set(libraryTracks.map((t) => t.id)));
+  };
+
+  const handleDeselectAll = () => {
+    setSelectedTrackIds(new Set());
+  };
+
+  const handleSelectPending = () => {
+    const pendingIds = libraryTracks
+      .filter((t) => !stateFile.completed_clips[t.id])
+      .map((t) => t.id);
+    setSelectedTrackIds(new Set(pendingIds));
   };
 
   // Summary result state
@@ -364,7 +452,7 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
   };
 
   // Start or Resume Backup Process
-  const handleStartBackup = async () => {
+  const handleStartBackup = async (tracksOverride?: SunoTrack[]) => {
     if (!bearerToken.trim()) {
       addLog("ERROR: Please enter a valid Suno Bearer Token.", "error");
       return;
@@ -401,7 +489,11 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
 
     let tracksToProcess: SunoTrack[] = [];
 
-    if (useLiveApi) {
+    if (tracksOverride && tracksOverride.length > 0) {
+      tracksToProcess = tracksOverride;
+      setTotalTrackCount(tracksOverride.length);
+      addLog(`🎯 Batch Queue initialized with ${tracksOverride.length} selected tracks.`, "info");
+    } else if (useLiveApi) {
       addLog("Connecting to Suno AI Live API (https://studio-api.suno.ai/api/feed/)...", "info");
       try {
         const res = await fetch("/api/suno-proxy", {
@@ -425,6 +517,7 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
           return;
         }
         tracksToProcess = fetchedClips;
+        setLibraryTracks(fetchedClips);
         setTotalTrackCount(fetchedClips.length);
         addLog(`Successfully retrieved ${fetchedClips.length} tracks from live Suno account!`, "success");
       } catch (err: any) {
@@ -719,6 +812,17 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
     }
   };
 
+  const handleStartBatchSelected = () => {
+    const selected = libraryTracks.filter((t) => selectedTrackIds.has(t.id));
+    if (selected.length === 0) {
+      addLog("⚠️ No tracks selected. Please check at least one track in the Library Catalog table.", "warn");
+      return;
+    }
+    setActiveTab("dashboard");
+    addLog(`🎯 Initiating batch download for ${selected.length} user-selected songs...`, "info");
+    handleStartBackup(selected);
+  };
+
   return (
     <div className="space-y-6">
       {/* Suno Sept 3 Download Limits Alert Notice */}
@@ -892,7 +996,76 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
             </div>
           </div>
 
-          {/* 1. Bearer Token & Cookie Section */}
+          {/* PySide6 QTabWidget Simulated Tab Navigation Bar */}
+          <div className="flex flex-wrap items-center gap-1.5 border-b border-zinc-800 pb-2">
+            <button
+              type="button"
+              onClick={() => setActiveTab("dashboard")}
+              className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold transition-all border cursor-pointer ${
+                activeTab === "dashboard"
+                  ? "bg-blue-600 text-white border-blue-500 shadow-md shadow-blue-900/30"
+                  : isLight
+                  ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300"
+                  : "bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              <Zap className="w-3.5 h-3.5" />
+              <span>🚀 Backup Dashboard</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab("library")}
+              className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold transition-all border cursor-pointer ${
+                activeTab === "library"
+                  ? "bg-blue-600 text-white border-blue-500 shadow-md shadow-blue-900/30"
+                  : isLight
+                  ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300"
+                  : "bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              <ListChecks className="w-3.5 h-3.5" />
+              <span>📁 Library Catalog & Batch Downloader</span>
+              <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono font-bold ${
+                activeTab === "library" ? "bg-white/20 text-white" : "bg-blue-500/20 text-blue-400"
+              }`}>
+                {selectedTrackIds.size}/{libraryTracks.length}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab("guide")}
+              className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold transition-all border cursor-pointer ${
+                activeTab === "guide"
+                  ? "bg-blue-600 text-white border-blue-500 shadow-md shadow-blue-900/30"
+                  : isLight
+                  ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300"
+                  : "bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+              <span>📖 Token & Setup Guide</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab("settings")}
+              className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold transition-all border cursor-pointer ${
+                activeTab === "settings"
+                  ? "bg-blue-600 text-white border-blue-500 shadow-md shadow-blue-900/30"
+                  : isLight
+                  ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300"
+                  : "bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              <Sliders className="w-3.5 h-3.5" />
+              <span>⚙️ Settings</span>
+            </button>
+          </div>
+
+          {activeTab === "dashboard" && (
+            <div className="space-y-5">
           <div
             className={`border rounded-xl p-4 space-y-3.5 ${
               isLight ? "bg-white border-slate-200" : "bg-[#121215]/80 border-zinc-800/80"
@@ -1588,6 +1761,408 @@ export const PySideSimulator: React.FC<{ theme?: "dark" | "light" }> = ({ theme 
               })}
             </div>
           </div>
+            </div>
+          )}
+
+          {/* TAB 2: LIBRARY CATALOG & BATCH SELECTOR */}
+          {activeTab === "library" && (
+            <div className="space-y-4 animate-fadeIn">
+              {/* Library Control Bar */}
+              <div
+                className={`border rounded-xl p-4 space-y-3.5 ${
+                  isLight ? "bg-white border-slate-200" : "bg-[#121215] border-zinc-800"
+                }`}
+              >
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-bold text-zinc-100 flex items-center space-x-2">
+                      <ListChecks className="w-4 h-4 text-blue-400" />
+                      <span>Interactive Library Catalog & Selective Batch Downloader</span>
+                    </h3>
+                    <p className="text-xs text-zinc-400 mt-0.5">
+                      Select specific songs to download, or export your full library metadata (lyrics, style tags, audio URLs) into CSV or JSON formats.
+                    </p>
+                  </div>
+
+                  {/* Batch Action Buttons */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleStartBatchSelected}
+                      disabled={selectedTrackIds.size === 0 || isRunning}
+                      className="flex items-center space-x-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-600 text-white shadow-md shadow-blue-900/30 transition-all cursor-pointer border border-blue-400/20"
+                    >
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      <span>Download Selected ({selectedTrackIds.size})</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleExportCsvCatalog}
+                      className="flex items-center space-x-1.5 px-3 py-2 rounded-xl text-xs font-bold bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border border-emerald-500/40 transition-all cursor-pointer shadow-sm"
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5" />
+                      <span>Export CSV</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleExportJsonCatalog}
+                      className="flex items-center space-x-1.5 px-3 py-2 rounded-xl text-xs font-bold bg-purple-600/20 hover:bg-purple-600/30 text-purple-400 border border-purple-500/40 transition-all cursor-pointer shadow-sm"
+                    >
+                      <FileJson className="w-3.5 h-3.5" />
+                      <span>Export JSON</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Filter and Selection Toolbar */}
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-zinc-800">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative min-w-[240px]">
+                      <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-zinc-500" />
+                      <input
+                        type="text"
+                        placeholder="Search title, genre, style prompt, lyrics..."
+                        value={librarySearchQuery}
+                        onChange={(e) => setLibrarySearchQuery(e.target.value)}
+                        className={`w-full border rounded-lg pl-8 pr-3 py-1.5 text-xs font-sans focus:outline-none focus:border-blue-500 ${
+                          isLight
+                            ? "bg-slate-50 border-slate-300 text-slate-900"
+                            : "bg-[#09090b] border-zinc-800 text-zinc-200"
+                        }`}
+                      />
+                    </div>
+
+                    <select
+                      value={libraryFilterStatus}
+                      onChange={(e) => setLibraryFilterStatus(e.target.value as any)}
+                      className={`border rounded-lg px-2.5 py-1.5 text-xs font-sans focus:outline-none focus:border-blue-500 cursor-pointer ${
+                        isLight
+                          ? "bg-slate-50 border-slate-300 text-slate-900"
+                          : "bg-[#09090b] border-zinc-800 text-zinc-200"
+                      }`}
+                    >
+                      <option value="all">All Tracks ({libraryTracks.length})</option>
+                      <option value="completed">Completed ({completedCount})</option>
+                      <option value="pending">Pending ({remainingCount})</option>
+                    </select>
+                  </div>
+
+                  {/* Multi-selection Buttons */}
+                  <div className="flex items-center space-x-2 text-xs">
+                    <button
+                      type="button"
+                      onClick={handleSelectAll}
+                      className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 transition-colors cursor-pointer"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSelectPending}
+                      className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-amber-400 border border-zinc-700 transition-colors cursor-pointer"
+                    >
+                      Select Pending
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDeselectAll}
+                      className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 border border-zinc-700 transition-colors cursor-pointer"
+                    >
+                      Deselect All
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Interactive Song Table */}
+              <div className="border border-zinc-800 rounded-xl bg-[#121215] overflow-hidden">
+                <div className="max-h-[420px] overflow-y-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-[#09090b] border-b border-zinc-800 text-zinc-400 font-mono sticky top-0 z-10 select-none">
+                      <tr>
+                        <th className="p-3 w-10 text-center">
+                          <input
+                            type="checkbox"
+                            checked={selectedTrackIds.size > 0 && selectedTrackIds.size === libraryTracks.length}
+                            onChange={(e) => {
+                              if (e.target.checked) handleSelectAll();
+                              else handleDeselectAll();
+                            }}
+                            className="rounded border-zinc-700 text-blue-600 focus:ring-0 w-3.5 h-3.5 bg-zinc-900 cursor-pointer"
+                          />
+                        </th>
+                        <th className="p-3">Track Info & Model</th>
+                        <th className="p-3 hidden md:table-cell">Prompt & Style Tags</th>
+                        <th className="p-3 w-28 text-center">Assets Available</th>
+                        <th className="p-3 w-28 text-right">Backup Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-800/60 font-sans">
+                      {libraryTracks
+                        .filter((track) => {
+                          const q = librarySearchQuery.toLowerCase();
+                          const matchesQuery =
+                            !q ||
+                            (track.title || "").toLowerCase().includes(q) ||
+                            (track.prompt || "").toLowerCase().includes(q) ||
+                            (track.gpt_description_prompt || "").toLowerCase().includes(q) ||
+                            (track.model_name || "").toLowerCase().includes(q);
+
+                          const isComp = Boolean(stateFile.completed_clips[track.id]);
+                          if (libraryFilterStatus === "completed" && !isComp) return false;
+                          if (libraryFilterStatus === "pending" && isComp) return false;
+
+                          return matchesQuery;
+                        })
+                        .map((track) => {
+                          const isSelected = selectedTrackIds.has(track.id);
+                          const isCompleted = Boolean(stateFile.completed_clips[track.id]);
+
+                          return (
+                            <tr
+                              key={track.id}
+                              className={`transition-colors hover:bg-zinc-800/40 ${
+                                isSelected ? "bg-blue-500/5" : ""
+                              }`}
+                            >
+                              <td className="p-3 text-center">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={() => handleToggleSelectTrack(track.id)}
+                                  className="rounded border-zinc-700 text-blue-600 focus:ring-0 w-3.5 h-3.5 bg-zinc-900 cursor-pointer"
+                                />
+                              </td>
+                              <td className="p-3">
+                                <div className="flex items-center space-x-3">
+                                  {track.image_url ? (
+                                    <img
+                                      src={track.image_url}
+                                      alt={track.title || "artwork"}
+                                      className="w-10 h-10 rounded-lg object-cover border border-zinc-700/80 shrink-0 shadow-sm"
+                                      referrerPolicy="no-referrer"
+                                    />
+                                  ) : (
+                                    <div className="w-10 h-10 rounded-lg bg-zinc-800 flex items-center justify-center text-zinc-500 shrink-0">
+                                      <Music className="w-5 h-5" />
+                                    </div>
+                                  )}
+                                  <div className="space-y-0.5">
+                                    <span className="font-bold text-zinc-200 block truncate max-w-[220px]">
+                                      {track.title || "Untitled Track"}
+                                    </span>
+                                    <div className="flex items-center space-x-2 text-[10px] text-zinc-400 font-mono">
+                                      <span>{track.model_name || "v3.5"}</span>
+                                      <span>•</span>
+                                      <span>{track.duration ? `${Math.round(track.duration)}s` : "120s"}</span>
+                                      {track.is_liked && (
+                                        <>
+                                          <span>•</span>
+                                          <span className="text-rose-400">♥ Liked</span>
+                                        </>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="p-3 hidden md:table-cell text-zinc-400 text-xs">
+                                <p className="line-clamp-2 max-w-sm text-[11px] leading-relaxed">
+                                  {track.prompt || track.gpt_description_prompt || "No prompt description"}
+                                </p>
+                              </td>
+                              <td className="p-3 text-center">
+                                <div className="flex items-center justify-center space-x-1">
+                                  <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                                    WAV
+                                  </span>
+                                  <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-blue-500/10 text-blue-400 border border-blue-500/30">
+                                    MP4
+                                  </span>
+                                  <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-amber-500/10 text-amber-400 border border-amber-500/30">
+                                    JSON
+                                  </span>
+                                </div>
+                              </td>
+                              <td className="p-3 text-right">
+                                {isCompleted ? (
+                                  <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/40">
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    <span>Saved</span>
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/40">
+                                    <Clock className="w-3 h-3" />
+                                    <span>Pending</span>
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 3: SETUP & TOKEN GUIDE */}
+          {activeTab === "guide" && (
+            <div className="space-y-4 animate-fadeIn">
+              <div
+                className={`border rounded-xl p-5 space-y-4 ${
+                  isLight ? "bg-white border-slate-200" : "bg-[#121215] border-zinc-800"
+                }`}
+              >
+                <div className="flex items-center space-x-2.5 border-b border-zinc-800 pb-3">
+                  <BookOpen className="w-5 h-5 text-blue-400" />
+                  <div>
+                    <h3 className="text-sm font-bold text-zinc-100 uppercase tracking-tight">
+                      Suno Authentication & Token Guide
+                    </h3>
+                    <p className="text-xs text-zinc-400">
+                      Follow these 4 simple steps to copy your live authentication session token from Suno.com.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                  <div className="border border-zinc-800/80 rounded-xl p-3.5 bg-[#09090b] space-y-1.5">
+                    <span className="text-xs font-bold text-blue-400 font-mono">STEP 1: Open Suno.com</span>
+                    <p className="text-xs text-zinc-300 leading-relaxed">
+                      Log in to your Suno account in Chrome, Edge, Brave, or Firefox.
+                    </p>
+                  </div>
+
+                  <div className="border border-zinc-800/80 rounded-xl p-3.5 bg-[#09090b] space-y-1.5">
+                    <span className="text-xs font-bold text-blue-400 font-mono">STEP 2: Open DevTools</span>
+                    <p className="text-xs text-zinc-300 leading-relaxed">
+                      Press <kbd className="bg-zinc-800 px-1 py-0.5 rounded text-[11px] font-mono">F12</kbd> or <kbd className="bg-zinc-800 px-1 py-0.5 rounded text-[11px] font-mono">Ctrl+Shift+I</kbd> and navigate to the <strong>Network</strong> tab.
+                    </p>
+                  </div>
+
+                  <div className="border border-zinc-800/80 rounded-xl p-3.5 bg-[#09090b] space-y-1.5">
+                    <span className="text-xs font-bold text-blue-400 font-mono">STEP 3: Refresh and Filter</span>
+                    <p className="text-xs text-zinc-300 leading-relaxed">
+                      Press <kbd className="bg-zinc-800 px-1 py-0.5 rounded text-[11px] font-mono">Ctrl+R</kbd> to refresh. Filter the network requests by typing <code className="text-amber-400 font-mono">feed?page=0</code>.
+                    </p>
+                  </div>
+
+                  <div className="border border-zinc-800/80 rounded-xl p-3.5 bg-[#09090b] space-y-1.5">
+                    <span className="text-xs font-bold text-blue-400 font-mono">STEP 4: Copy Authorization</span>
+                    <p className="text-xs text-zinc-300 leading-relaxed">
+                      Under Request Headers, copy the value of <code className="text-emerald-400 font-mono">authorization: Bearer eyJ...</code> and paste it into the token box.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="pt-2 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setIsQuickSetupOpen(true)}
+                    className="flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold bg-amber-600 hover:bg-amber-500 text-white shadow-md transition-all cursor-pointer"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Launch 30-Second Interactive Token Assistant</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 4: ADVANCED SETTINGS */}
+          {activeTab === "settings" && (
+            <div className="space-y-4 animate-fadeIn">
+              {/* Subfolder Organization */}
+              <div
+                className={`border rounded-xl p-4 space-y-2 ${
+                  isLight ? "bg-white border-slate-200" : "bg-[#121215] border-zinc-800"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold uppercase tracking-wider text-purple-400 block">
+                    Folder Organization Routing
+                  </label>
+                  <span className="text-[10px] opacity-60 font-mono">Auto-Folder Router</span>
+                </div>
+                <select
+                  value={folderGrouping}
+                  onChange={(e) => setFolderGrouping(e.target.value as "none" | "date" | "album")}
+                  disabled={isRunning}
+                  className={`w-full border rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-purple-500 font-sans cursor-pointer ${
+                    isLight
+                      ? "bg-slate-50 border-slate-300 text-slate-800"
+                      : "bg-[#09090b] border-zinc-800 text-zinc-200"
+                  }`}
+                >
+                  <option value="none">Flat Directory (No Subfolders - all files in root)</option>
+                  <option value="date">Subfolders by Date Created (YYYY-MM)</option>
+                  <option value="album">Subfolders by Album Name / Musical Genre</option>
+                </select>
+              </div>
+
+              {/* Human Mimicry & CDN Anti-Block Delay */}
+              <div
+                className={`border rounded-xl p-4 space-y-3 ${
+                  isLight ? "bg-white border-slate-200" : "bg-[#121215] border-zinc-800"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold uppercase tracking-wider text-purple-400 block flex items-center space-x-1.5">
+                    <Clock className="w-3.5 h-3.5 text-purple-500" />
+                    <span>Human Mimicry & Anti-Block Delay</span>
+                  </label>
+                  <span className="text-[10px] bg-purple-500/10 text-purple-400 border border-purple-500/20 px-1.5 py-0.5 rounded font-mono font-bold">
+                    CDN 403 PROTECTION
+                  </span>
+                </div>
+
+                <p className={`text-[11px] leading-relaxed ${isLight ? "text-slate-600" : "text-zinc-400"}`}>
+                  Configurable randomized pause between track download requests to mimic natural browsing, preventing rate limits and IP blocks from the Suno CDN.
+                </p>
+
+                <div className="grid grid-cols-2 gap-3 text-xs">
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-semibold text-slate-600 dark:text-zinc-400">
+                      Min Delay (Seconds):
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={30}
+                      step={0.5}
+                      value={minDelay}
+                      onChange={(e) => setMinDelay(Math.max(0, parseFloat(e.target.value) || 0))}
+                      disabled={isRunning}
+                      className={`w-full border rounded-xl px-3 py-1.5 font-mono text-xs focus:outline-none focus:border-purple-500 ${
+                        isLight ? "bg-slate-50 border-slate-300 text-slate-800" : "bg-[#09090b] border-zinc-800 text-zinc-100"
+                      }`}
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-semibold text-slate-600 dark:text-zinc-400">
+                      Max Delay (Seconds):
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={60}
+                      step={0.5}
+                      value={maxDelay}
+                      onChange={(e) => setMaxDelay(Math.max(minDelay, parseFloat(e.target.value) || 0))}
+                      disabled={isRunning}
+                      className={`w-full border rounded-xl px-3 py-1.5 font-mono text-xs focus:outline-none focus:border-purple-500 ${
+                        isLight ? "bg-slate-50 border-slate-300 text-slate-800" : "bg-[#09090b] border-zinc-800 text-zinc-100"
+                      }`}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

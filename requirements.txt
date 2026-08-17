@@ -1,5 +1,10 @@
-pyinstaller
-pyside6
+requests>=2.31.0
+urllib3>=2.0.0
+certifi
+charset-normalizer
+idna
+PySide6
 soundfile
 pydub
 numpy
+pyinstaller

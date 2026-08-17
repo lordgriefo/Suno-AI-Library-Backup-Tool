@@ -1,0 +1,5 @@
+pyinstaller
+pyside6
+soundfile
+pydub
+numpy

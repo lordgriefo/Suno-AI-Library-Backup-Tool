@@ -196,6 +196,49 @@ def build_full_browser_headers(token: str = "", cookie_str: str = "") -> Dict[st
     return headers
 
 
+def extract_clips_from_response(data: Any) -> List[Dict[str, Any]]:
+    """Robust extractor that handles all Suno API JSON schemas and wrapper structures."""
+    if not data:
+        return []
+    
+    if isinstance(data, list):
+        return [c for c in data if isinstance(c, dict) and ("id" in c or "title" in c or "audio_url" in c)]
+        
+    if isinstance(data, dict):
+        # Look for direct list keys
+        for key in ["clips", "items", "data", "results", "songs", "tracks", "project_clips"]:
+            val = data.get(key)
+            if isinstance(val, list) and val:
+                extracted = []
+                for item in val:
+                    if isinstance(item, dict):
+                        if "clip" in item and isinstance(item["clip"], dict):
+                            extracted.append(item["clip"])
+                        elif "id" in item or "title" in item or "audio_url" in item:
+                            extracted.append(item)
+                if extracted:
+                    return extracted
+                    
+        # Playlist clips wrapper
+        if "playlist_clips" in data and isinstance(data["playlist_clips"], list):
+            extracted = []
+            for item in data["playlist_clips"]:
+                if isinstance(item, dict):
+                    if "clip" in item and isinstance(item["clip"], dict):
+                        extracted.append(item["clip"])
+                    elif "id" in item or "title" in item:
+                        extracted.append(item)
+            if extracted:
+                return extracted
+                
+        # Dict of clips keyed by ID
+        dict_clips = [v for v in data.values() if isinstance(v, dict) and ("id" in v or "audio_url" in v or "title" in v)]
+        if dict_clips:
+            return dict_clips
+
+    return []
+
+
 def get_ffmpeg_executable() -> Optional[str]:
     """Finds FFmpeg executable in PATH, imageio_ffmpeg, or local directory."""
     ffmpeg_bin = shutil.which("ffmpeg")
@@ -578,11 +621,7 @@ class BackupWorker(QThread):
                 self.log(f"JSON parse error on page {page + 1}: {e}", "error")
                 break
             
-            page_clips = []
-            if isinstance(data, list):
-                page_clips = data
-            elif isinstance(data, dict):
-                page_clips = data.get("clips") or data.get("items") or data.get("data") or []
+            page_clips = extract_clips_from_response(data)
             
             if not page_clips:
                 self.log(f"Discovered a total of {len(all_clips)} tracks across your Suno library.", "info")
@@ -958,6 +997,8 @@ class SunoBackupWindow(QMainWindow):
         super().__init__()
         self.worker: Optional[BackupWorker] = None
         self.catalog_tracks = []
+        self.selected_track_ids = set()
+        self.is_updating_table = False
         self.init_ui()
 
     def init_ui(self):
@@ -1030,6 +1071,7 @@ class SunoBackupWindow(QMainWindow):
         self.tabs.addTab(self.tab_settings, "⚙️ Advanced Settings")
 
         self.check_existing_state()
+        self.auto_load_offline_catalog()
 
     def setup_dashboard_tab(self):
         layout = QVBoxLayout(self.tab_dashboard)
@@ -1047,7 +1089,6 @@ class SunoBackupWindow(QMainWindow):
         self.token_input = QLineEdit()
         self.token_input.setPlaceholderText("Paste fresh Suno Bearer token (from studio-api.suno.ai Authorization header)...")
         self.token_input.setEchoMode(QLineEdit.Password)
-        self.token_input.textChanged.connect(self.on_token_changed)
         
         self.toggle_token_btn = QPushButton("👁️ Show")
         self.toggle_token_btn.setFixedWidth(75)
@@ -1467,6 +1508,33 @@ class SunoBackupWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Failed", f"Failed to write JSON file:\n{e}")
 
+    def auto_load_offline_catalog(self):
+        """Silently auto-populates the Library Catalog on startup if previous backup state exists."""
+        save_path = Path(self.dir_input.text().strip())
+        cat_file = save_path / CATALOG_JSON_FILENAME
+        if cat_file.exists():
+            try:
+                with open(cat_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    tracks = data.get("tracks", [])
+                    if tracks:
+                        self.table.setRowCount(0)
+                        self.catalog_tracks = []
+                        self.selected_track_ids.clear()
+                        for t in tracks:
+                            self.add_catalog_row(t)
+                        self.pill_total.setText(f"Tracks: {len(tracks)}")
+            except Exception:
+                pass
+        elif (save_path / STATE_FILENAME).exists():
+            try:
+                with open(save_path / STATE_FILENAME, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    completed = len(data.get("completed_clips", {}))
+                    self.pill_done.setText(f"Done: {completed}")
+            except Exception:
+                pass
+
     def fetch_feed_catalog_only(self):
         token = clean_header_value(self.token_input.text())
         cookie_val = clean_header_value(self.cookie_input.text())
@@ -1474,42 +1542,112 @@ class SunoBackupWindow(QMainWindow):
             QMessageBox.warning(self, "Token Required", "Please enter your Bearer token in the Dashboard tab first.")
             return
 
-        self.table.setRowCount(0)
-        self.catalog_tracks = []
-        self.selected_track_ids.clear()
-        self.btn_download_selected.setText("📥 Download Selected (0)")
-        
-        headers = build_full_browser_headers(token, cookie_val)
-        session = requests.Session()
-        session.headers.update(headers)
-        
-        self.append_log("Fetching library catalog from Suno API...", "info")
-        
-        page = 0
-        total_fetched = 0
-        while True:
-            url = f"https://studio-api.suno.ai/api/feed/?page={page}"
-            try:
-                r = session.get(url, timeout=12)
-                if r.status_code == 401:
-                    QMessageBox.critical(self, "Token Expired", "❌ Suno returned 401 Unauthorized. Please refresh Suno.com and paste a new token.")
+        # Check JWT Expiration
+        exp_ts, exp_str = decode_jwt_expiry(token)
+        if exp_ts and time.time() > exp_ts:
+            diff = int(time.time() - exp_ts)
+            ans = QMessageBox.question(
+                self,
+                "Token Expired Warning",
+                f"Your Bearer token expired {diff}s ago ({exp_str}).\n\nSuno will likely return 401 Unauthorized.\n\nDo you want to attempt fetching anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if ans == QMessageBox.No:
+                return
+
+        self.btn_fetch_feed.setEnabled(False)
+        self.btn_fetch_feed.setText("⏳ Fetching...")
+        QApplication.processEvents()
+
+        try:
+            self.table.setRowCount(0)
+            self.catalog_tracks = []
+            self.selected_track_ids.clear()
+            self.btn_download_selected.setText("📥 Download Selected (0)")
+            
+            headers = build_full_browser_headers(token, cookie_val)
+            session = requests.Session()
+            session.headers.update(headers)
+            
+            self.append_log("Connecting to Suno library API...", "info")
+            
+            candidate_endpoints = [
+                "https://studio-api.suno.ai/api/feed/",
+                "https://studio-api.suno.ai/api/feed/v2",
+                "https://studio-api-prod.suno.com/api/feed/",
+                "https://studio-api.suno.ai/api/feed/?hide_trashed=true"
+            ]
+            
+            active_base_url = None
+            for ep in candidate_endpoints:
+                try:
+                    sep = "&" if "?" in ep else "?"
+                    r_test = session.get(f"{ep}{sep}page=0", timeout=12)
+                    if r_test.status_code == 200:
+                        test_clips = extract_clips_from_response(r_test.json())
+                        active_base_url = ep
+                        self.append_log(f"Connected to API endpoint ({ep}). Found {len(test_clips)} items on first probe.", "success")
+                        break
+                    elif r_test.status_code == 401:
+                        self.append_log(f"401 Unauthorized at {ep}. Bearer token expired.", "error")
+                except Exception as e:
+                    self.append_log(f"Endpoint probe note ({ep}): {e}", "warn")
+                    continue
+
+            if not active_base_url:
+                active_base_url = "https://studio-api.suno.ai/api/feed/"
+
+            page = 0
+            total_fetched = 0
+            while True:
+                sep = "&" if "?" in active_base_url else "?"
+                url = f"{active_base_url}{sep}page={page}"
+                try:
+                    r = session.get(url, timeout=15)
+                    if r.status_code == 401:
+                        self.append_log(f"HTTP 401 Unauthorized at page {page}. Suno Bearer token expired.", "error")
+                        QMessageBox.critical(self, "Token Expired (401)", "❌ Suno returned 401 Unauthorized.\n\nYour Bearer token has expired. Please refresh Suno.com and copy a new token from DevTools.")
+                        break
+                    r.raise_for_status()
+                    data = r.json()
+                    page_clips = extract_clips_from_response(data)
+                    if not page_clips:
+                        self.append_log(f"Reached end of library feed at page {page}.", "info")
+                        break
+                        
+                    for c in page_clips:
+                        self.add_catalog_row(c)
+                    total_fetched += len(page_clips)
+                    self.append_log(f"Fetched page {page + 1}: +{len(page_clips)} tracks (Total: {total_fetched})", "info")
+                    page += 1
+                    QApplication.processEvents()
+                    time.sleep(0.2)
+                except Exception as e:
+                    self.append_log(f"Feed fetch completed or stopped at page {page}: {e}", "warn")
                     break
-                r.raise_for_status()
-                data = r.json()
-                page_clips = data if isinstance(data, list) else (data.get("clips") or data.get("items") or [])
-                if not page_clips:
-                    break
-                for c in page_clips:
-                    self.add_catalog_row(c)
-                total_fetched += len(page_clips)
-                page += 1
-                QApplication.processEvents()
-            except Exception as e:
-                self.append_log(f"Catalog fetch stopped at page {page}: {e}", "warn")
-                break
-                
-        self.pill_total.setText(f"Tracks: {len(self.catalog_tracks)}")
-        QMessageBox.information(self, "Catalog Loaded", f"✅ Successfully fetched {len(self.catalog_tracks)} tracks from your Suno account!")
+                    
+            self.pill_total.setText(f"Tracks: {len(self.catalog_tracks)}")
+            if len(self.catalog_tracks) > 0:
+                # Auto-save catalog JSON and state for future offline loading
+                save_path = Path(self.dir_input.text().strip())
+                try:
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    cat_json_path = save_path / CATALOG_JSON_FILENAME
+                    with open(cat_json_path, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "total_tracks": len(self.catalog_tracks),
+                            "tracks": self.catalog_tracks
+                        }, f, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+                QMessageBox.information(self, "Catalog Loaded", f"✅ Successfully loaded {len(self.catalog_tracks)} tracks from your Suno account!")
+            else:
+                QMessageBox.warning(self, "Catalog Empty", "⚠️ No tracks were found in the response.\n\nIf you have songs on Suno, verify your Bearer Token or check that you are logged into the correct Suno account.")
+        finally:
+            self.btn_fetch_feed.setEnabled(True)
+            self.btn_fetch_feed.setText("🔄 Fetch Feed from Suno")
 
     def start_selected_backup(self):
         if not self.selected_track_ids:
@@ -1659,6 +1797,7 @@ class SunoBackupWindow(QMainWindow):
         if folder:
             self.dir_input.setText(folder)
             self.check_existing_state()
+            self.auto_load_offline_catalog()
 
     def open_save_directory(self):
         path_str = self.dir_input.text().strip()
@@ -1837,7 +1976,19 @@ class SunoBackupWindow(QMainWindow):
             self.table.setRowHidden(r, not (match_text and match_status))
 
     def reload_catalog_from_file(self):
-        cat_file = Path(self.dir_input.text().strip()) / CATALOG_JSON_FILENAME
+        curr_dir = Path(self.dir_input.text().strip())
+        cat_file = curr_dir / CATALOG_JSON_FILENAME
+        
+        if not cat_file.exists():
+            # Allow user to browse for a backup folder or json file
+            chosen_dir = QFileDialog.getExistingDirectory(self, "Select Backup Folder with suno_library_catalog.json", str(curr_dir))
+            if chosen_dir:
+                self.dir_input.setText(chosen_dir)
+                curr_dir = Path(chosen_dir)
+                cat_file = curr_dir / CATALOG_JSON_FILENAME
+            else:
+                return
+
         if cat_file.exists():
             try:
                 with open(cat_file, "r", encoding="utf-8") as f:
@@ -1849,11 +2000,16 @@ class SunoBackupWindow(QMainWindow):
                     for t in tracks:
                         self.add_catalog_row(t)
                     self.pill_total.setText(f"Tracks: {len(tracks)}")
-                    QMessageBox.information(self, "Catalog Loaded", f"✅ Loaded {len(tracks)} tracks from offline index!")
+                    self.check_existing_state()
+                    QMessageBox.information(self, "Catalog Loaded", f"✅ Loaded {len(tracks)} tracks from offline index:\n{cat_file}")
             except Exception as e:
-                QMessageBox.warning(self, "Catalog", f"Error loading catalog: {e}")
+                QMessageBox.warning(self, "Catalog", f"Error loading catalog:\n{e}")
+        elif (curr_dir / STATE_FILENAME).exists():
+            # State exists, check existing state
+            self.check_existing_state()
+            QMessageBox.information(self, "State Found", f"Found backup state in {curr_dir}.\nClick 'Fetch Feed from Suno' to populate full metadata for these tracks.")
         else:
-            QMessageBox.information(self, "Catalog", "Run a backup or click 'Fetch Feed from Suno' first to populate the catalog.")
+            QMessageBox.information(self, "Catalog Not Found", f"No '{CATALOG_JSON_FILENAME}' found in:\n{curr_dir}\n\nRun a backup or click 'Fetch Feed from Suno' to create one.")
 
     def start_full_backup(self):
         self.start_backup(selected_clips=None)
